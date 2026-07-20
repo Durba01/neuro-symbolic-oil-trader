@@ -28,6 +28,11 @@ def get_latest_oanda_data():
     
     # 1. Get Balance
     bal_res = requests.get(f"{OANDA_URL}/summary", headers=HEADERS)
+    
+    # Optional Debug Lines
+    print(f"DEBUG - OANDA HTTP Status: {bal_res.status_code}")
+    print(f"DEBUG - OANDA Raw Response: {bal_res.text}")
+    
     if bal_res.status_code != 200:
         print("OANDA is under maintenance or keys are invalid.")
         return None, None, None
@@ -37,6 +42,12 @@ def get_latest_oanda_data():
     # 2. Get last 5 days of prices (to feed the LSTM sequence)
     candle_url = f"https://api-fxpractice.oanda.com/v3/instruments/{INSTRUMENT}/candles?count=5&granularity=D"
     candle_res = requests.get(candle_url, headers=HEADERS)
+    
+    # Robust error check for the candle data
+    if candle_res.status_code != 200:
+        print(f"❌ OANDA Candle Fetch Failed: {candle_res.status_code} - {candle_res.text}")
+        return None, None, None
+        
     candles = candle_res.json().get('candles', [])
     
     price_data = []
@@ -137,15 +148,16 @@ def run_trading_cycle():
         
         print(f"✅ Trade Successful! Order ID: {order_id} filled at ${price_filled}")
         
+        # CLEANED MARKDOWN STRING (Safely formatted for Telegram)
         alert = (
             f"🚨 *DEEP-OIL TRADE EXECUTED* 🚨\n\n"
-            f"**Action:** {trade_direction}\n"
-            f"**Asset:** WTI Crude Oil (WTICO_USD)\n"
-            f"**Price Filled:** ${price_filled}\n"
-            f"**Size:** {units} units\n"
-            f"**Order ID:** {order_id}\n\n"
-            f"🧠 *AI Confidence:* {prediction:.2f}\n"
-            f"📰 *Macro Rationale:* {sentiment['summary']}"
+            f"*Action:* {trade_direction}\n"
+            f"*Asset:* WTI Crude Oil (WTICO-USD)\n"  # Changed underscore to hyphen to prevent Telegram crash
+            f"*Price Filled:* ${price_filled}\n"
+            f"*Size:* {units} units\n"
+            f"*Order ID:* {order_id}\n\n"
+            f"*AI Confidence:* {prediction:.2f}\n"
+            f"*Macro Rationale:* {sentiment['summary']}"
         )
         send_telegram_alert(alert)
         
