@@ -1,0 +1,29 @@
+# Exclude Python virtual environment
+venv/
+.venv/
+env/
+
+# Exclude private environment variables and credentials
+.env
+
+# Exclude Python compiled bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Exclude local database and historical datasets
+*.db
+*.csv
+wti_historical_data.csv
+
+# Exclude local execution log files
+*.log
+master_agent.log
+
+# Exclude PyTorch saved weights
+*.pth
+oil_brain_weights.pth
+
+# Exclude macOS system metadata
+.DS_Store
