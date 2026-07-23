@@ -28,11 +28,6 @@ def get_latest_oanda_data():
     
     # 1. Get Balance
     bal_res = requests.get(f"{OANDA_URL}/summary", headers=HEADERS)
-    
-    # Optional Debug Lines
-    print(f"DEBUG - OANDA HTTP Status: {bal_res.status_code}")
-    print(f"DEBUG - OANDA Raw Response: {bal_res.text}")
-    
     if bal_res.status_code != 200:
         print("OANDA is under maintenance or keys are invalid.")
         return None, None, None
@@ -78,6 +73,28 @@ def execute_oanda_order(units: float, action: str):
     }
     
     res = requests.post(url, json=payload, headers=HEADERS)
+    return res.json()
+
+def get_open_trades():
+    """Queries OANDA for all active, open trades for our target instrument."""
+    url = f"{OANDA_URL}/openTrades"
+    res = requests.get(url, headers=HEADERS)
+    if res.status_code == 200:
+        trades = res.json().get("trades", [])
+        # Filter for WTICO_USD only
+        return [t for t in trades if t.get("instrument") == INSTRUMENT]
+    return []
+
+def modify_trade_stop_loss(trade_id: str, price: float):
+    """Updates or attaches a Stop Loss order to an active trade."""
+    url = f"{OANDA_URL}/trades/{trade_id}/orders"
+    payload = {
+        "stopLoss": {
+            "timeInForce": "GTC",
+            "price": f"{price:.3f}" # Format to 3 decimal places for OANDA commodities
+        }
+    }
+    res = requests.put(url, json=payload, headers=HEADERS)
     return res.json()
 
 def run_trading_cycle():
@@ -134,53 +151,114 @@ def run_trading_cycle():
     else:
         print("⚖️ Market is neutral. AI chooses to HOLD.")
         send_telegram_alert(f"🤖 *Deep-Oil Agent*\nMarket neutral (Score: {prediction:.2f}). Holding positions.")
-        return
+        # Proceed to passive management even on HOLD
+        units = 0
 
-    # STEP 5: Execution Intent
-    print("\n[STEP 5] Routing Order to OANDA Exchange...")
-    order_res = execute_oanda_order(units, trade_direction)
-    
-    # Parse the response from OANDA
-    if "orderFillTransaction" in order_res:
-        fill = order_res["orderFillTransaction"]
-        price_filled = fill.get("price")
-        order_id = fill.get("id")
+    # STEP 5: Execution Intent (If a new position is approved)
+    if units > 0:
+        print("\n[STEP 5] Routing Order to OANDA Exchange...")
+        order_res = execute_oanda_order(units, trade_direction)
         
-        print(f"✅ Trade Successful! Order ID: {order_id} filled at ${price_filled}")
-        
-        # CLEANED MARKDOWN STRING (Safely formatted for Telegram)
-        alert = (
-            f"🚨 *DEEP-OIL TRADE EXECUTED* 🚨\n\n"
-            f"*Action:* {trade_direction}\n"
-            f"*Asset:* WTI Crude Oil (WTICO-USD)\n"  # Changed underscore to hyphen to prevent Telegram crash
-            f"*Price Filled:* ${price_filled}\n"
-            f"*Size:* {units} units\n"
-            f"*Order ID:* {order_id}\n\n"
-            f"*AI Confidence:* {prediction:.2f}\n"
-            f"*Macro Rationale:* {sentiment['summary']}"
-        )
-        send_telegram_alert(alert)
-        
-    elif "orderCancelTransaction" in order_res:
-        cancel = order_res["orderCancelTransaction"]
-        reason = cancel.get("reason", "UNKNOWN_REASON")
-        
-        if reason == "MARKET_HALTED":
-            friendly_reason = "OANDA Market is currently Halted (Weekend / Holiday Close)."
-        else:
-            friendly_reason = f"Order canceled by broker. Reason: {reason}"
+        # Parse the response from OANDA
+        if "orderFillTransaction" in order_res:
+            fill = order_res["orderFillTransaction"]
+            price_filled = fill.get("price")
+            order_id = fill.get("id")
             
-        print(f"⚠️ Order Canceled: {friendly_reason}")
-        send_telegram_alert(f"🤖 *Deep-Oil Agent*\nOrder proposed but canceled: {friendly_reason}")
-        
-    else:
-        error_msg = order_res.get("errorMessage", "Unknown execution error.")
-        print(f"❌ Order Placement Failed: {error_msg}")
-        print(f"DEBUG - Full Broker Response: {json.dumps(order_res, indent=2)}")
-        send_telegram_alert(f"⚠️ *Deep-Oil Agent Error*\nFailed to execute order: {error_msg}")
-        
-    print("✅ Cycle Complete!")
+            print(f"✅ Trade Successful! Order ID: {order_id} filled at ${price_filled}")
+            
+            alert = (
+                f"🚨 *DEEP-OIL TRADE EXECUTED* 🚨\n\n"
+                f"*Action:* {trade_direction}\n"
+                f"*Asset:* WTI Crude Oil (WTICO-USD)\n"
+                f"*Price Filled:* ${price_filled}\n"
+                f"*Size:* {units} units\n"
+                f"*Order ID:* {order_id}\n\n"
+                f"*AI Confidence:* {prediction:.2f}\n"
+                f"*Macro Rationale:* {sentiment['summary']}"
+            )
+            send_telegram_alert(alert)
+        elif "orderCancelTransaction" in order_res:
+            cancel = order_res["orderCancelTransaction"]
+            reason = cancel.get("reason", "UNKNOWN_REASON")
+            
+            if reason == "MARKET_HALTED":
+                friendly_reason = "OANDA Market is currently Halted (Weekend / Holiday Close)."
+            else:
+                friendly_reason = f"Order canceled by broker. Reason: {reason}"
+                
+            print(f"⚠️ Order Canceled: {friendly_reason}")
+            send_telegram_alert(f"🤖 *Deep-Oil Agent*\nOrder proposed but canceled: {friendly_reason}")
+        else:
+            error_msg = order_res.get("errorMessage", "Unknown execution error.")
+            print(f"❌ Order Placement Failed: {error_msg}")
+            send_telegram_alert(f"⚠️ *Deep-Oil Agent Error*\nFailed to execute order: {error_msg}")
 
-# These two lines are completely left-aligned (no spaces)
+    # STEP 6: Active Risk Sweep (The Break-Even & Trailing Stop Guardrails)
+    print("\n[STEP 6] Running Active Risk Sweep on Open Positions...")
+    open_trades = get_open_trades()
+    print(f"Found {len(open_trades)} active trades to evaluate.")
+    
+    # Calculate rolling daily volatility (ATR proxy) from the last 5 daily candles
+    # ATR proxy = Average of (Daily High - Daily Low)
+    atr_val = np.mean([c[1] - c[2] for c in price_history])
+    print(f"Calculated Daily Volatility (ATR Proxy): ${atr_val:.3f}")
+    
+    # Set multipliers (Usually loaded from hyperparameters.json, we set solid quant defaults)
+    break_even_threshold = atr_val * 1.5   # If trade gains 1.5x ATR, activate break-even
+    trailing_stop_multiplier = atr_val * 2.0  # Trail stop-loss at 2.0x ATR behind peak
+    
+    for t in open_trades:
+        trade_id = t["id"]
+        entry_price = float(t["price"])
+        current_units = float(t["currentUnits"])
+        side = "LONG" if current_units > 0 else "SHORT"
+        unrealized_pl = float(t["unrealizedPL"])
+        
+        # Get the current active Stop Loss price if it exists
+        current_sl = None
+        if "stopLossOrder" in t:
+            current_sl = float(t["stopLossOrder"].get("price"))
+            
+        print(f"\nEvaluating Trade ID {trade_id} ({side}) | Entry: ${entry_price:.3f} | Current SL: ${f'{current_sl:.3f}' if current_sl else 'None'}")
+        
+        if side == "LONG":
+            # 1. Evaluate Break-Even Shield
+            # If price has gained more than break-even threshold and SL is not yet at entry
+            if (current_price - entry_price) >= break_even_threshold:
+                if current_sl is None or current_sl < entry_price:
+                    print(f"🛡️ BREAK-EVEN SHIELD ACTIVE: Moving SL to entry price (${entry_price:.3f})")
+                    modify_trade_stop_loss(trade_id, entry_price)
+                    send_telegram_alert(f"🛡️ *Risk Shield: Break-Even Activated*\nTrade ID {trade_id} (WTI Long) Stop Loss moved to Entry Price: `${entry_price:.3f}`. Trade is now risk-free!")
+                    current_sl = entry_price # Update local tracker
+            
+            # 2. Evaluate Trailing Stop
+            # Trail price: current_price - stop_distance
+            calculated_sl = current_price - trailing_stop_multiplier
+            if calculated_sl > entry_price: # Only trail if we are locking in profit
+                if current_sl is None or calculated_sl > current_sl:
+                    print(f"📈 TRAILING STOP ACTIVE: Sliding SL up to ${calculated_sl:.3f}")
+                    modify_trade_stop_loss(trade_id, calculated_sl)
+                    send_telegram_alert(f"📈 *Risk Shield: Trailing Stop Activated*\nTrade ID {trade_id} (WTI Long) Stop Loss slid up to `${calculated_sl:.3f}` to lock in profits!")
+                    
+        elif side == "SHORT":
+            # 1. Evaluate Break-Even Shield (Inverse calculation for short trades)
+            if (entry_price - current_price) >= break_even_threshold:
+                if current_sl is None or current_sl > entry_price:
+                    print(f"🛡️ BREAK-EVEN SHIELD ACTIVE: Moving SL to entry price (${entry_price:.3f})")
+                    modify_trade_stop_loss(trade_id, entry_price)
+                    send_telegram_alert(f"🛡️ *Risk Shield: Break-Even Activated*\nTrade ID {trade_id} (WTI Short) Stop Loss moved to Entry Price: `${entry_price:.3f}`. Trade is now risk-free!")
+                    current_sl = entry_price
+            
+            # 2. Evaluate Trailing Stop
+            calculated_sl = current_price + trailing_stop_multiplier
+            if calculated_sl < entry_price: # Only trail if we are locking in profit
+                if current_sl is None or calculated_sl < current_sl:
+                    print(f"📈 TRAILING STOP ACTIVE: Sliding SL down to ${calculated_sl:.3f}")
+                    modify_trade_stop_loss(trade_id, calculated_sl)
+                    send_telegram_alert(f"📈 *Risk Shield: Trailing Stop Activated*\nTrade ID {trade_id} (WTI Short) Stop Loss slid down to `${calculated_sl:.3f}` to lock in profits!")
+                    
+    print("\n✅ Cycle Complete!")
+
 if __name__ == "__main__":
     run_trading_cycle()
