@@ -2,8 +2,10 @@
 import os
 import json
 import numpy as np
+import pandas as pd
 import torch
 import requests
+import yfinance as yf
 from dotenv import load_dotenv
 
 # Import our custom modules
@@ -22,54 +24,82 @@ OANDA_URL = f"https://api-fxpractice.oanda.com/v3/accounts/{OANDA_ACCOUNT}"
 HEADERS = {"Authorization": f"Bearer {OANDA_TOKEN}", "Accept-Datetime-Format": "RFC3339"}
 INSTRUMENT = "WTICO_USD" # OANDA's ticker for WTI Crude Oil
 
+# Institutional Risk Settings
+MAX_ALLOWED_SPREAD = 0.08  # Max $0.08 bid-ask spread tolerance to prevent entry slippage
+
 def get_latest_oanda_data():
-    """Fetches account balance and the last 5 days of Oil prices from OANDA."""
-    print("🌐 Connecting to OANDA...")
+    """Fetches balance, daily candles, 1-hour candles, and live spread from OANDA."""
+    print("🌐 Connecting to OANDA V20 Engine...")
     
-    # 1. Get Balance
+    # 1. Fetch Account Balance
     bal_res = requests.get(f"{OANDA_URL}/summary", headers=HEADERS)
     if bal_res.status_code != 200:
         print("OANDA is under maintenance or keys are invalid.")
-        return None, None, None
+        return None, None, None, None, None
         
     balance = float(bal_res.json()['account']['balance'])
     
-    # 2. Get last 5 days of prices (to feed the LSTM sequence)
-    candle_url = f"https://api-fxpractice.oanda.com/v3/instruments/{INSTRUMENT}/candles?count=5&granularity=D"
-    candle_res = requests.get(candle_url, headers=HEADERS)
-    
-    # Robust error check for the candle data
-    if candle_res.status_code != 200:
-        print(f"❌ OANDA Candle Fetch Failed: {candle_res.status_code} - {candle_res.text}")
-        return None, None, None
+    # 2. Fetch Live Price & Spread Check (Feature A: Slippage Shield)
+    price_url = f"{OANDA_URL}/pricing?instruments={INSTRUMENT}"
+    price_res = requests.get(price_url, headers=HEADERS)
+    if price_res.status_code != 200:
+        print("Failed to fetch live pricing.")
+        return None, None, None, None, None
         
-    candles = candle_res.json().get('candles', [])
+    prices = price_res.json().get("prices", [])[0]
+    bid = float(prices["bids"][0]["price"])
+    ask = float(prices["asks"][0]["price"])
+    current_price = (bid + ask) / 2.0
+    spread = ask - bid
     
-    price_data = []
-    current_price = 0.0
-    for c in candles:
+    # 3. Fetch 5 Daily Candles (Macro Trend)
+    d1_url = f"https://api-fxpractice.oanda.com/v3/instruments/{INSTRUMENT}/candles?count=5&granularity=D"
+    d1_res = requests.get(d1_url, headers=HEADERS)
+    d1_candles = d1_res.json().get('candles', [])
+    
+    d1_data = []
+    for c in d1_candles:
         mid = c['mid']
-        # [Open, High, Low, Close, Volume]
-        price_data.append([float(mid['o']), float(mid['h']), float(mid['l']), float(mid['c']), float(c['volume'])])
-        current_price = float(mid['c'])
+        d1_data.append([float(mid['o']), float(mid['h']), float(mid['l']), float(mid['c']), float(c['volume'])])
         
-    return balance, price_data, current_price
+    # 4. Fetch 1-Hour Candles (Feature B: Multi-Timeframe Confluence)
+    h1_url = f"https://api-fxpractice.oanda.com/v3/instruments/{INSTRUMENT}/candles?count=6&granularity=H1"
+    h1_res = requests.get(h1_url, headers=HEADERS)
+    h1_candles = h1_res.json().get('candles', [])
+    
+    # Compute 1-Hour Trend Direction
+    h1_open = float(h1_candles[0]['mid']['o'])
+    h1_close = float(h1_candles[-1]['mid']['c'])
+    h1_bullish = h1_close > h1_open
+
+    return balance, d1_data, current_price, spread, h1_bullish
+
+def get_dxy_macro_signal():
+    """Feature D: Ingests the US Dollar Index (DXY) to measure currency correlation."""
+    try:
+        dxy = yf.Ticker("DX-Y.NYB")
+        hist = dxy.history(period="2d")
+        if len(hist) >= 2:
+            prev_close = hist['Close'].iloc[-2]
+            latest_close = hist['Close'].iloc[-1]
+            pct_change = ((latest_close - prev_close) / prev_close) * 100
+            return round(pct_change, 2)
+    except Exception as e:
+        print(f"DXY fetch failed: {e}")
+    return 0.0
 
 def execute_oanda_order(units: float, action: str, current_price: float, atr_val: float):
-    """Sends the actual trade order to OANDA's V20 API with automated, volatility-adjusted SL & TP."""
+    """Sends trade order to OANDA with automated SL & TP bracket parameters."""
     url = f"{OANDA_URL}/orders"
-    
-    # OANDA represents Short (SELL) trades using negative units
     trade_units = str(int(units)) if "BUY" in action else str(-int(units))
     
-    # Volatility Multipliers (Risk-to-Reward ratio of 1:1.5)
-    sl_multiplier = 2.0  # Risk 2x ATR
-    tp_multiplier = 3.0  # Target 3x ATR (Balanced, neither too conservative nor too greedy)
+    sl_multiplier = 2.0  
+    tp_multiplier = 3.0  
     
     if "BUY" in action:
         sl_price = current_price - (atr_val * sl_multiplier)
         tp_price = current_price + (atr_val * tp_multiplier)
-    else:  # SELL / Short
+    else:  
         sl_price = current_price + (atr_val * sl_multiplier)
         tp_price = current_price - (atr_val * tp_multiplier)
         
@@ -77,234 +107,195 @@ def execute_oanda_order(units: float, action: str, current_price: float, atr_val
         "order": {
             "units": trade_units,
             "instrument": INSTRUMENT,
-            "timeInForce": "FOK", # Fill-Or-Kill
+            "timeInForce": "FOK",
             "type": "MARKET",
             "positionFill": "DEFAULT",
-            "stopLossOnFill": {
-                "timeInForce": "GTC",
-                "price": f"{sl_price:.3f}"
-            },
-            "takeProfitOnFill": {
-                "timeInForce": "GTC",
-                "price": f"{tp_price:.3f}"
-            }
+            "stopLossOnFill": {"timeInForce": "GTC", "price": f"{sl_price:.3f}"},
+            "takeProfitOnFill": {"timeInForce": "GTC", "price": f"{tp_price:.3f}"}
         }
     }
-    
-    res = requests.post(url, json=payload, headers=HEADERS)
-    return res.json()
+    return requests.post(url, json=payload, headers=HEADERS).json()
 
 def get_open_trades():
-    """Queries OANDA for all active, open trades for our target instrument."""
+    """Queries OANDA for active trades."""
     url = f"{OANDA_URL}/openTrades"
     res = requests.get(url, headers=HEADERS)
     if res.status_code == 200:
-        trades = res.json().get("trades", [])
-        return [t for t in trades if t.get("instrument") == INSTRUMENT]
+        return [t for t in res.json().get("trades", []) if t.get("instrument") == INSTRUMENT]
     return []
 
-def modify_trade_stop_loss(trade_id: str, price: float):
-    """Updates or attaches a Stop Loss order to an active trade."""
-    url = f"{OANDA_URL}/trades/{trade_id}/orders"
-    payload = {
-        "stopLoss": {
-            "timeInForce": "GTC",
-            "price": f"{price:.3f}"
-        }
-    }
+def partial_close_trade(trade_id: str, units_to_close: int):
+    """Feature C: Scale-Out Profit Engine (Closes a fraction of units)."""
+    url = f"{OANDA_URL}/trades/{trade_id}/close"
+    payload = {"units": str(units_to_close)}
     res = requests.put(url, json=payload, headers=HEADERS)
     return res.json()
 
+def modify_trade_stop_loss(trade_id: str, price: float):
+    """Updates stop loss price."""
+    url = f"{OANDA_URL}/trades/{trade_id}/orders"
+    payload = {"stopLoss": {"timeInForce": "GTC", "price": f"{price:.3f}"}}
+    return requests.put(url, json=payload, headers=HEADERS).json()
+
 def run_trading_cycle():
     print("=========================================")
-    print("🚀 DEEP-OIL NEURO-SYMBOLIC AGENT AWAKE")
+    print("🚀 DEEP-OIL INSTITUTIONAL AGENT AWAKE")
     print("=========================================")
     
-    # STEP 1: The Senses (Fetch live news and Gemini sentiment)
-    print("\n[STEP 1] Activating AI Senses...")
-    sentiment = analyze_news_tensor()
-    gemini_vector = [sentiment['bullish_score'], sentiment['bearish_score'], sentiment['supply_shock_risk']]
-    
-    # STEP 2: The Data (Fetch OANDA prices and balance)
-    print("\n[STEP 2] Fetching Live Broker Data...")
-    balance, price_history, current_price = get_latest_oanda_data()
+    # STEP 1: AI Senses
+    print("\n[STEP 1] Activating AI Senses & Macro Scrapers...")
+    try:
+        sentiment = analyze_news_tensor()
+        gemini_vector = [sentiment['bullish_score'], sentiment['bearish_score'], sentiment['supply_shock_risk']]
+    except Exception as e:
+        print(f"❌ AI Senses Failed due to network drop: {e}")
+        send_telegram_alert(f"⚠️ *Deep-Oil Agent Warning*\nNetwork drop during news analysis: {e}")
+        return
+
+    # STEP 2: Ingest Broker & DXY Data
+    print("\n[STEP 2] Fetching Live Market Data & Macro Metrics...")
+    balance, d1_history, current_price, spread, h1_bullish = get_latest_oanda_data()
     
     if balance is None:
-        print("⚠️ Waiting for OANDA maintenance to end (7:00 PM BST). Agent resting.")
+        print("⚠️ Waiting for OANDA maintenance to end. Agent resting.")
         return
         
-    print(f"💰 Confirmed Balance: £{balance}")
-    print(f"🛢️ Current WTI Price: ${current_price}")
+    dxy_change = get_dxy_macro_signal()
+    atr_val = np.mean([c[1] - c[2] for c in d1_history])
+    
+    print(f"💰 Confirmed Balance: £{balance:.2f}")
+    print(f"🛢️ WTI Price: ${current_price:.3f} | Live Spread: ${spread:.3f}")
+    print(f"💵 US Dollar Index (DXY) 24H Shift: {dxy_change}%")
+    print(f"📊 Calculated Volatility (ATR Proxy): ${atr_val:.3f}")
 
-    # Calculate rolling daily volatility (ATR proxy) from the last 5 daily candles
-    atr_val = np.mean([c[1] - c[2] for c in price_history])
-    print(f"Calculated Daily Volatility (ATR Proxy): ${atr_val:.3f}")
+    # FEATURE A: SLIPPAGE SHIELD CHECK
+    if spread > MAX_ALLOWED_SPREAD:
+        print(f"🛡️ SPREAD SHIELD ACTIVE: Live spread (${spread:.3f}) exceeds max allowed limit (${MAX_ALLOWED_SPREAD}). Halting entry.")
+        send_telegram_alert(f"🛡️ *Risk Shield Active*\nExecution paused: Spread spiked to `${spread:.3f}` (exceeds $0.08 limit).")
+        return
 
-    # STEP 3: The Brain (Load PyTorch and Predict)
-    print("\n[STEP 3] Waking up Deep Learning Brain...")
+    # STEP 3: PyTorch Neural Prediction
+    print("\n[STEP 3] Running PyTorch LSTM Inference...")
     model = DeepOilLSTM()
     model.load_state_dict(torch.load("oil_brain_weights.pth"))
-    model.eval() # Set to evaluation mode
+    model.eval()
     
-    # Format data for the Neural Network (Scale prices roughly between 0-1)
-    scaled_prices = np.array(price_history) / 100.0 
-    
-    # Combine 5 days of prices with today's Gemini news vector
-    combined_seq = []
-    for prices in scaled_prices:
-        combined_seq.append(np.hstack((prices, gemini_vector)))
-        
-    # Optimized numpy conversion to silence the PyTorch UserWarning
+    scaled_prices = np.array(d1_history) / 100.0 
+    combined_seq = [np.hstack((prices, gemini_vector)) for prices in scaled_prices]
     tensor_data = torch.tensor(np.array([combined_seq]), dtype=torch.float32)
     
     with torch.no_grad():
         prediction = model(tensor_data).item()
         
-    print(f"🧠 Neural Network Prediction Score: {prediction:.4f} (0=Crash, 1=Moon)")
+    print(f"🧠 Neural Prediction Score: {prediction:.4f} (0=Crash/Short, 1=Moon/Long)")
 
-    # STEP 4: The Shield (Risk Management with EIA Fundamental Overlay)
-    print("\n[STEP 4] Passing through Risk Gate...")
+    # STEP 4: Risk Gate & Macro Overrides
+    print("\n[STEP 4] Passing Through Risk Gate & Multi-Timeframe Check...")
     
-    # --- EIA FUNDAMENTAL OVERLAY ---
+    # Read EIA Fundamental Data
     eia_veto = False
     eia_reason = ""
-    
     if os.path.exists("eia_fundamental.json"):
         try:
             with open("eia_fundamental.json", "r") as f:
                 eia_data = json.load(f)
-            
-            # If a fresh report (last 24-48 hours) is active
             if eia_data.get("is_new_release"):
                 impact = eia_data.get("fundamental_impact")
-                change = eia_data.get("inventory_change_millions")
-                
-                # Check for contradictory signals
                 if prediction > 0.65 and impact == "BEARISH":
                     eia_veto = True
-                    eia_reason = f"Highly Bearish Weekly EIA Inventory Report (Unexpected Build of {change}M barrels)."
+                    eia_reason = "Bearish EIA Inventory Report Build."
                 elif prediction < 0.35 and impact == "BULLISH":
                     eia_veto = True
-                    eia_reason = f"Highly Bullish Weekly EIA Inventory Report (Unexpected Draw of {change}M barrels)."
+                    eia_reason = "Bullish EIA Inventory Report Draw."
         except Exception as e:
-            print(f"Failed to parse EIA fundamental data: {e}")
-    # -------------------------------
+            print(f"EIA read error: {e}")
 
+    # FEATURE B: MULTI-TIMEFRAME CONFLUENCE CHECK
     if eia_veto:
-        print(f"🛡️ RISK OVERRIDE: Vetoing trade signal due to: {eia_reason}")
-        send_telegram_alert(f"🛡️ *Risk Shield: Trade Vetoed*\nAI suggested a Long trade, but the **Risk Gate vetoed it** due to a contradictory: {eia_reason}")
+        print(f"🛡️ RISK OVERRIDE: Trade vetoed due to: {eia_reason}")
+        send_telegram_alert(f"🛡️ *Risk Shield: Trade Vetoed*\nContradictory EIA Release: {eia_reason}")
         units = 0
     elif prediction > 0.65:
-        trade_direction = "BUY (Long)"
-        units = calculate_order_size(balance, current_price)
+        if not h1_bullish:
+            print("⏳ MULTI-TIMEFRAME HOLD: Daily trend is Bullish, but 1-Hour chart is pulling back. Waiting for entry alignment.")
+            units = 0
+        else:
+            trade_direction = "BUY (Long)"
+            units = calculate_order_size(balance, current_price)
     elif prediction < 0.35:
-        trade_direction = "SELL (Short)"
-        units = calculate_order_size(balance, current_price)
+        if h1_bullish:
+            print("⏳ MULTI-TIMEFRAME HOLD: Daily trend is Bearish, but 1-Hour chart is bouncing. Waiting for entry alignment.")
+            units = 0
+        else:
+            trade_direction = "SELL (Short)"
+            units = calculate_order_size(balance, current_price)
     else:
-        print("⚖️ Market is neutral. AI chooses to HOLD.")
-        send_telegram_alert(f"🤖 *Deep-Oil Agent*\nMarket neutral (Score: {prediction:.2f}). Holding positions.")
+        print("⚖️ Market Signal Neutral. Agent Holding.")
         units = 0
 
-    # STEP 5: Execution Intent with Automated Bracket Orders
+    # STEP 5: Order Execution with Brackets
     if units > 0:
-        print("\n[STEP 5] Routing Order with Bracket SL/TP to OANDA...")
-        # Now passing current_price and atr_val to calculate automated targets on-fill
+        print(f"\n[STEP 5] Dispatching {trade_direction} Order to OANDA...")
         order_res = execute_oanda_order(units, trade_direction, current_price, atr_val)
         
-        # Parse the response from OANDA
         if "orderFillTransaction" in order_res:
             fill = order_res["orderFillTransaction"]
             price_filled = float(fill.get("price"))
             order_id = fill.get("id")
             
-            # Extract actual placed TP/SL levels for logging
-            trade_opened = fill.get("tradeOpened", {})
-            sl_level = float(trade_opened.get("stopLossOrder", {}).get("price", 0.0))
-            tp_level = float(trade_opened.get("takeProfitOrder", {}).get("price", 0.0))
-            
-            print(f"✅ Trade Successful! Order ID: {order_id} filled at ${price_filled:.3f}")
-            print(f"🎯 Bracket Targets Attached -> SL: ${sl_level:.3f} | TP: ${tp_level:.3f}")
-            
             alert = (
-                f"🚨 *DEEP-OIL BRACKET TRADE EXECUTED* 🚨\n\n"
+                f"🚨 *INSTITUTIONAL TRADE EXECUTED* 🚨\n\n"
                 f"*Action:* {trade_direction}\n"
                 f"*Asset:* WTI Crude Oil (WTICO-USD)\n"
                 f"*Price Filled:* ${price_filled:.3f}\n"
                 f"*Size:* {units} units\n"
                 f"*Order ID:* {order_id}\n\n"
-                f"🎯 *Bracket Targets Locked On-Fill:*\n"
-                f"• Stop Loss: `${sl_level:.3f}`\n"
-                f"• Take Profit: `${tp_level:.3f}`\n\n"
-                f"🧠 *AI Confidence:* {prediction:.2f}\n"
-                f"📰 *Macro Rationale:* {sentiment['summary']}"
+                f"*Spread:* `${spread:.3f}` | *DXY Shift:* `{dxy_change}%`\n"
+                f"*AI Confidence:* `{prediction:.2f}`"
             )
             send_telegram_alert(alert)
-        elif "orderCancelTransaction" in order_res:
-            cancel = order_res["orderCancelTransaction"]
-            reason = cancel.get("reason", "UNKNOWN_REASON")
-            print(f"⚠️ Order Canceled: {reason}")
-        else:
-            error_msg = order_res.get("errorMessage", "Unknown execution error.")
-            print(f"❌ Order Placement Failed: {error_msg}")
 
-    # STEP 6: Active Risk Sweep (The Break-Even & Trailing Stop Guardrails)
-    print("\n[STEP 6] Running Active Risk Sweep on Open Positions...")
+    # STEP 6: Active Risk Sweep & Feature C Scale-Out Engine
+    print("\n[STEP 6] Running Active Risk Sweep & Scale-Out Engine...")
     open_trades = get_open_trades()
-    print(f"Found {len(open_trades)} active trades to evaluate.")
+    print(f"Evaluating {len(open_trades)} active trades.")
     
-    # Sizing thresholds matching OANDA parameters
-    break_even_threshold = atr_val * 1.5   
-    trailing_stop_multiplier = atr_val * 2.0  
+    scale_out_threshold = atr_val * 1.5   # Target for 50% partial profit take
+    break_even_threshold = atr_val * 1.5  # Move SL to entry
+    trailing_multiplier = atr_val * 2.0   # Trail behind price
     
     for t in open_trades:
         trade_id = t["id"]
         entry_price = float(t["price"])
+        initial_units = abs(float(t["initialUnits"]))
         current_units = float(t["currentUnits"])
+        abs_current_units = abs(current_units)
         side = "LONG" if current_units > 0 else "SHORT"
         
-        # Get the current active Stop Loss price if it exists
-        current_sl = None
-        if "stopLossOrder" in t:
-            current_sl = float(t["stopLossOrder"].get("price"))
-            
-        print(f"\nEvaluating Trade ID {trade_id} ({side}) | Entry: ${entry_price:.3f} | Current SL: ${f'{current_sl:.3f}' if current_sl else 'None'}")
+        current_sl = float(t["stopLossOrder"].get("price")) if "stopLossOrder" in t else None
         
         if side == "LONG":
-            # 1. Evaluate Break-Even Shield
-            if (current_price - entry_price) >= break_even_threshold:
+            profit_distance = current_price - entry_price
+            
+            # FEATURE C: SCALE-OUT HARVESTER (Close 50% of units at 1.5x ATR)
+            if profit_distance >= scale_out_threshold and abs_current_units == initial_units:
+                half_units = int(initial_units / 2)
+                print(f"💰 SCALE-OUT HARVESTER: Closing 50% ({half_units} units) of Trade ID {trade_id} to lock in cash!")
+                partial_close_trade(trade_id, half_units)
+                send_telegram_alert(f"💰 *Profit Harvester Active*\nTrade ID {trade_id} hit 1.5x ATR profit! **Closed 50% ({half_units} units)** to secure realized cash.")
+            
+            # Break-Even & Trailing Stop Evaluation
+            if profit_distance >= break_even_threshold:
                 if current_sl is None or current_sl < entry_price:
-                    print(f"🛡️ BREAK-EVEN SHIELD ACTIVE: Moving SL to entry price (${entry_price:.3f})")
                     modify_trade_stop_loss(trade_id, entry_price)
-                    send_telegram_alert(f"🛡️ *Risk Shield: Break-Even Activated*\nTrade ID {trade_id} (WTI Long) Stop Loss moved to Entry Price: `${entry_price:.3f}`. Trade is now risk-free!")
-                    current_sl = entry_price 
-            
-            # 2. Evaluate Trailing Stop
-            calculated_sl = current_price - trailing_stop_multiplier
-            if calculated_sl > entry_price: 
-                if current_sl is None or calculated_sl > current_sl:
-                    print(f"📈 TRAILING STOP ACTIVE: Sliding SL up to ${calculated_sl:.3f}")
-                    modify_trade_stop_loss(trade_id, calculated_sl)
-                    send_telegram_alert(f"📈 *Risk Shield: Trailing Stop Activated*\nTrade ID {trade_id} (WTI Long) Stop Loss slid up to `${calculated_sl:.3f}` to lock in profits!")
+                    send_telegram_alert(f"🛡️ *Break-Even Shield:* Trade ID {trade_id} SL moved to entry price (${entry_price:.3f}).")
                     
-        elif side == "SHORT":
-            # 1. Evaluate Break-Even Shield
-            if (entry_price - current_price) >= break_even_threshold:
-                if current_sl is None or current_sl > entry_price:
-                    print(f"🛡️ BREAK-EVEN SHIELD ACTIVE: Moving SL to entry price (${entry_price:.3f})")
-                    modify_trade_stop_loss(trade_id, entry_price)
-                    send_telegram_alert(f"🛡️ *Risk Shield: Break-Even Activated*\nTrade ID {trade_id} (WTI Short) Stop Loss moved to Entry Price: `${entry_price:.3f}`. Trade is now risk-free!")
-                    current_sl = entry_price
-            
-            # 2. Evaluate Trailing Stop
-            calculated_sl = current_price + trailing_stop_multiplier
-            if calculated_sl < entry_price: 
-                if current_sl is None or calculated_sl < current_sl:
-                    print(f"📈 TRAILING STOP ACTIVE: Sliding SL down to ${calculated_sl:.3f}")
-                    modify_trade_stop_loss(trade_id, calculated_sl)
-                    send_telegram_alert(f"📈 *Risk Shield: Trailing Stop Activated*\nTrade ID {trade_id} (WTI Short) Stop Loss slid down to `${calculated_sl:.3f}` to lock in profits!")
-                    
+            calc_sl = current_price - trailing_multiplier
+            if calc_sl > entry_price and (current_sl is None or calc_sl > current_sl):
+                modify_trade_stop_loss(trade_id, calc_sl)
+                send_telegram_alert(f"📈 *Trailing Stop:* Trade ID {trade_id} SL slid up to `${calc_sl:.3f}`.")
+                
     print("\n✅ Cycle Complete!")
 
-# These two lines are completely left-aligned (no spaces)
 if __name__ == "__main__":
     run_trading_cycle()
