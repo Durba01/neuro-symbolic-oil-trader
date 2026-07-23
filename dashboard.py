@@ -161,7 +161,7 @@ with tab1:
             
         st.markdown("---")
         
-        # LOCKED-IN HISTORICAL METRICS (Your requested feature!)
+        # LOCKED-IN HISTORICAL METRICS
         st.markdown("#### 🔒 Locked-In Historical Performance (Closed Trades)")
         m_col1, m_col2, m_col3, m_col4, m_col5 = st.columns(5)
         with m_col1:
@@ -174,6 +174,38 @@ with tab1:
             st.metric("Realized P&L (Locked-In)", f"£{metrics['realized_pnl']:.2f}")
         with m_col5:
             st.metric("Profit Factor", f"{metrics['profit_factor']:.2f}x")
+            
+        st.markdown("---")
+
+        # --- NEW SECTION: EIA WEEKLY FUNDAMENTAL CARD ---
+        st.markdown("#### 📊 Weekly EIA Inventory Fundamental Status")
+        if os.path.exists("eia_fundamental.json"):
+            try:
+                with open("eia_fundamental.json", "r") as f:
+                    eia_data = json.load(f)
+                
+                e_col1, e_col2, e_col3 = st.columns(3)
+                with e_col1:
+                    change = eia_data.get("inventory_change_millions", 0.0)
+                    # Green for positive draws (bullish), red for positive builds (bearish)
+                    st.metric(
+                        "EIA Inventory Change", 
+                        f"{change:+.3f}M Barrels", 
+                        delta=f"{change:+.3f}M" if change != 0 else None, 
+                        delta_color="inverse"
+                    )
+                with e_col2:
+                    impact = eia_data.get("fundamental_impact", "NEUTRAL")
+                    st.metric("Fundamental Impact", impact)
+                with e_col3:
+                    is_new = "ACTIVE (Last 48H)" if eia_data.get("is_new_release") else "INACTIVE (Old Report)"
+                    st.metric("Overlay Status", is_new)
+                
+                st.info(f"💡 *EIA AI Summary:* {eia_data.get('summary', 'No summary available.')}")
+            except Exception as e:
+                st.error(f"Failed to load EIA data: {e}")
+        else:
+            st.info("No EIA fundamental report parsed yet. Run eia_parser.py to initialize.")
             
         st.markdown("---")
 
